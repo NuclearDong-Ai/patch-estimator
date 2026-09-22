@@ -1,0 +1,15 @@
+# Render Blueprint for the shared field URL.
+# JOBNIMBUS_API_KEY is entered in the Render dashboard (sync: false). Do not put the key here.
+services:
+  - type: web
+    name: patch-estimator
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python jn_server.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: JOBNIMBUS_API_KEY
+        sync: false

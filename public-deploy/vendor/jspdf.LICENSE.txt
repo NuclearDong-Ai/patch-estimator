@@ -1,0 +1,5 @@
+jsPDF 2.5.2
+Copyright (c) 2010-2021 James Hall <james@parall.ax>, https://github.com/MrRio/jsPDF
+MIT License
+
+Vendored as vendor/jspdf.umd.min.js so the estimator can build PDFs without a CDN.

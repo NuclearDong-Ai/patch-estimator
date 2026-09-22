@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#123055">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Patch Estimator">
+  <title>Patch Estimator — 24 Hour Flood Pros</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="4" y="4" width="40" height="40" rx="8" fill="#f0b429"/>
+        <rect x="10" y="10" width="28" height="28" rx="4" fill="#fffaf2"/>
+        <rect x="20" y="18" width="16" height="16" rx="2" fill="#123055"/>
+      </svg>
+      <div>
+        <p class="company">24 Hour Flood Pros</p>
+        <h1>Patch Estimator</h1>
+      </div>
+    </div>
+    <p class="grand" id="grand-total" data-cents="74600">$746.00</p>
+  </header>
+
+  <main>
+    <section class="card" id="job-card">
+      <div class="label-row">
+        <label for="job-search">Job</label>
+        <button type="button" id="job-clear" class="text-button" hidden>Clear</button>
+      </div>
+      <p class="hint">POR-STR and POR-MIT only. The list is live from JobNimbus.</p>
+      <div class="job-field">
+        <input id="job-search" type="search" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Search job name, class, or workflow" aria-autocomplete="list" aria-controls="job-menu" aria-expanded="false">
+        <div id="job-menu" class="job-menu" role="listbox" hidden></div>
+      </div>
+      <p id="job-selected" class="selected" hidden></p>
+    </section>
+
+    <section class="card">
+      <h2>Price sheet</h2>
+      <p class="hint">One sheet for the whole estimate. Drywall and all-inclusive prices are never blended.</p>
+      <div class="sheets" role="group" aria-label="Price sheet">
+        <button type="button" id="sheet-drywall" class="sheet" aria-pressed="true">
+          Drywall only
+          <span>Base $746.00</span>
+        </button>
+        <button type="button" id="sheet-allin" class="sheet" aria-pressed="false">
+          All-inclusive
+          <span>Base $1,040.00</span>
+        </button>
+      </div>
+      <ul id="rate-legend" class="legend"></ul>
+      <p class="hint">Each patch is priced on its own. 100 SF and under uses the inspect-locked each price. Over 100 SF is a custom $ per SF with no inspect lock.</p>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>Patches</h2>
+        <button type="button" id="add-patch" class="secondary">Add patch</button>
+      </div>
+      <div id="patch-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>Manual add-ons</h2>
+      <p class="hint">These rates stay the same on either sheet.</p>
+      <div class="addon">
+        <label for="skim-sf">Skim coat <span>$7.80 / SF</span></label>
+        <input id="skim-sf" inputmode="decimal" autocomplete="off" placeholder="0">
+        <p id="skim-amount" class="addon-amount">$0.00</p>
+      </div>
+      <div class="addon">
+        <label for="paint-sf">Paint <span>$3.16 / SF</span></label>
+        <input id="paint-sf" inputmode="decimal" autocomplete="off" placeholder="0">
+        <p id="paint-amount" class="addon-amount">$0.00</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <label for="notes">Notes</label>
+      <textarea id="notes" maxlength="2000" rows="3" placeholder="Rooms, texture, or access notes"></textarea>
+    </section>
+
+    <section class="card">
+      <h2>Estimate</h2>
+      <div id="totals" class="totals"></div>
+      <p id="form-errors" class="errors" role="alert"></p>
+    </section>
+
+    <p id="status" class="status" role="status"></p>
+
+    <div class="actions">
+      <button type="button" id="download-pdf" class="primary">Download PDF</button>
+      <button type="button" id="send-jobnimbus" class="accent">Send to JobNimbus</button>
+    </div>
+  </main>
+
+  <dialog id="confirm-dialog">
+    <form method="dialog">
+      <h2>Send to JobNimbus?</h2>
+      <p id="confirm-text"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="send" id="confirm-send" class="accent">Send PDF</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>Turn on JavaScript to price patches and build the PDF.</noscript>
+  <script src="pricing.js"></script>
+  <script src="vendor/jspdf.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
