@@ -1,0 +1,2 @@
+# jn_server.py uses only the Python 3 standard library.
+# This file exists so Render's Python build can run pip install.

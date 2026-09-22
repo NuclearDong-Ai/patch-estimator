@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: patch-estimator
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python jn_server.py
+    envVars:
+      - key: JOBNIMBUS_API_KEY
+        sync: false
