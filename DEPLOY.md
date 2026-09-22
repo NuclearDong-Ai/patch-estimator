@@ -1,67 +1,53 @@
-# Deploy the Patch Estimator
+# Deploy Patch Estimator (shared HTTPS for all phones)
 
-This is the field app for 24 Hour Flood Pros. One public URL serves every phone. Techs can install it as a home-screen app. The JobNimbus key stays on the host.
+One permanent HTTPS URL. Any tech opens it and uses **Add to Home Screen**.
+No per-device install beyond the PWA. JobNimbus API key stays **server-side only**
+(never in the PWA / browser).
 
-## Render free web service
+The phone UI is the counter app: **Drywall only** or **All-inclusive** (never blended), with steppers for Under 10, 10–30, 30–50, 50–100, and Over 100. There is no inspect lock. The dollar total always works. Over 100 asks for SF and a custom dollar amount per patch, and a soft note appears if those fields are still empty. Skim is typed SF at $7.80 and paint is typed SF at $3.16.
 
-1. Push this repo and open [Render](https://render.com).
-2. **New → Blueprint** and select the repo. Render reads `render.yaml`.
-   - Service name: `patch-estimator`
-   - Plan: **free**
-   - Start command: `python jn_server.py`
-3. When Render asks for `JOBNIMBUS_API_KEY`, paste the JobNimbus key. `sync: false` means the key is **not** in the repo and is not overwritten by later blueprint syncs.
-4. Deploy. Render assigns a URL such as `https://patch-estimator.onrender.com`.
+## Render (free Web Service)
 
-That URL is the one every phone uses. You do not deploy a copy per person.
+`render.yaml` is a free web service named `patch-estimator`. `JOBNIMBUS_API_KEY` is `sync: false` — paste it in the Render dashboard. Do not put the key in git.
 
-### Connect the repo without the blueprint
-
-- Runtime: Python
-- Build command: `pip install -r requirements.txt`
-- Start command: `python jn_server.py`
-- Instance type: Free
-- Environment: `JOBNIMBUS_API_KEY` = the JobNimbus key
-- Health check path: `/`
-
-`requirements.txt` is intentionally empty. The server uses the Python standard library only. `PYTHON_VERSION` in the blueprint is `3.12.8`; change that value if Render no longer offers that patch release.
+1. Push this repo (or connect the folder) to GitHub/GitLab.
+2. In [Render](https://render.com): **New → Blueprint** and select the repo, or **New → Web Service**.
+3. Settings if you create the service by hand:
+   - **Root Directory:** leave blank when the repo root is this folder
+   - **Runtime:** Python
+   - **Plan:** Free
+   - **Build Command:** leave empty (no build step)
+   - **Start Command:** `python jn_server.py`
+4. Environment:
+   - `JOBNIMBUS_API_KEY` = your JobNimbus API key (required; never commit it)
+5. Deploy. Render assigns a stable HTTPS URL like `https://patch-estimator-xxxx.onrender.com`.
+6. Share that URL with every tech. On each phone: open in Safari/Chrome → **Add to Home Screen**.
 
 `Procfile` is the same start command (`web: python jn_server.py`) for hosts that read a Procfile instead of `render.yaml`.
 
-## Free-tier behavior
+### Notes
 
-Render free web services sleep after a stretch of no traffic. The first phone to open the URL after sleep can wait about a minute while the service wakes. Later phones hit the same awake URL. There is no disk to keep and no job cache: each search calls JobNimbus live.
-
-## Install on phones
-
-Send the Render URL to the crew.
-
-**iPhone:** open the URL in Safari → Share → Add to Home Screen. The icon is Patch Estimator. Pricing and a saved draft work from the home screen; search and send need a connection.
-
-**Android:** open the URL in Chrome → menu → Install app or Add to Home screen.
-
-The service worker caches the estimator shell so a dead spot does not wipe the page. `/api/` is never cached.
+- Free tier may sleep after idle; first open can be slow, then fine.
+- The server requires the key at startup (`JOBNIMBUS_API_KEY`, or the local secrets file it already reads). It serves `public-deploy/` at `/` and JobNimbus under `/api/jobnimbus/*`.
+- Job search is live. There is no job-list cache on the server or in the phone app.
 
 ## What the crew does
 
-1. Search the job (POR-STR or POR-MIT) and pick it.
-2. Choose Drywall only or All-inclusive. Do not expect the two sheets to mix.
-3. Enter each patch. 100 SF and under is inspect-locked. Over 100 SF needs a custom $ per SF.
-4. Add skim and paint square feet when they apply.
+1. Search the job (POR-STR or POR-MIT) at the top and pick it. Search waits about 300ms and runs again when the field is focused.
+2. Choose Drywall only (base $746) or All-inclusive (base $1,040). The other sheet’s rates do not stay on the quote.
+3. Count patches in each tier. Over 100 SF needs SF and a custom $ on that row. The total still shows if a custom field is blank.
+4. Type skim SF ($7.80) and paint SF ($3.16) when they apply.
 5. Download PDF, or Send to JobNimbus and confirm. The job name is on the PDF and in the file name. Send attaches the file to the existing job and does not create one.
 
-## Docker
+## Docker (optional)
 
 ```bash
 docker build -t patch-estimator .
-docker run --rm -p 8765:8765 -e JOBNIMBUS_API_KEY="your-key" -e PORT=8765 patch-estimator
+docker run -p 8765:8765 -e JOBNIMBUS_API_KEY=your_key patch-estimator
 ```
 
-The image is `python:3.12-slim` and runs as a non-root user. Pass the key at run time. Do not bake it into the image.
-
-Render's blueprint uses the native Python runtime, which fits the free plan. Use the Docker image when the host should run the container instead.
+The image is `python:3.12-slim`. Pass the key at run time. Do not bake it into the image.
 
 ## Keep the key out of git
 
-Do not put the key in `render.yaml`, the Dockerfile, a commit, or the browser. If a host log ever echoes an upstream error, the server redacts the key before it is written or returned.
-
-The shared URL is a tool, not a public page. Anyone who has it can look up POR-STR / POR-MIT jobs and attach a PDF. Send it to the crew, not to a marketing page or a search index (`robots.txt` already disallows crawlers).
+Do not put the key in `render.yaml`, the Dockerfile, a commit, or the browser. `sync: false` keeps a later blueprint sync from overwriting the dashboard value.

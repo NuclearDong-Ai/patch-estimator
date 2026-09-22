@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Patch Estimator server for 24 Hour Flood Pros.
+"""Patch Estimator static server + JobNimbus attach proxy.
 
-Serves the public-deploy PWA and proxies JobNimbus job search plus PDF
-attach. This process never creates jobs. The API key is read from the
-JOBNIMBUS_API_KEY environment variable and is never logged or returned.
+Serves public-deploy/ and JobNimbus API:
+  GET  /api/jobnimbus/jobs?q=…  — autocomplete job search
+  POST /api/jobnimbus/send      — attach PDF to an existing JN job
+
+API key: JOBNIMBUS_API_KEY env (cloud) or local secrets file — never logged
+or returned to clients / PWA. One shared HTTPS URL for all phones (PWA).
 """
 
 from __future__ import annotations
@@ -12,656 +15,775 @@ import base64
 import json
 import os
 import re
+import ssl
 import sys
-import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8765"))
-
+ROOT = Path(__file__).resolve().parent / "public-deploy"
+API_KEY_PATH = Path("/home/box/.secrets/jobnimbus_api_key")
 JN_BASE = "https://app.jobnimbus.com/api1/"
-MAX_BODY = 20 * 1024 * 1024
-JN_TIMEOUT = 20
-ROOT = os.path.dirname(os.path.abspath(__file__))
-PUBLIC_DIR = os.path.join(ROOT, "public-deploy")
-
-# Hyphen, space, or dash. STR/MIT must end at a word boundary so POR-STRATEGY does not match.
-POR_RE = re.compile("por[\\s\\-\u2010-\u2015]+(str|mit)\\b", re.IGNORECASE)
-JNID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-IDENTITY_KEYS = (
-    "name",
-    "class",
-    "class_name",
-    "workflow",
-    "workflow_name",
-    "record_type_name",
-)
-SEARCH_FIELDS = ("name", "class_name", "record_type_name")
-
-MIME = {
-    ".html": "text/html; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".webmanifest": "application/manifest+json",
-    ".json": "application/json; charset=utf-8",
-    ".png": "image/png",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
-    ".txt": "text/plain; charset=utf-8",
-}
+SEND_PATH = "/api/jobnimbus/send"
+JOBS_PATH = "/api/jobnimbus/jobs"
+# PDF base64 in JSON can be large
+MAX_BODY_BYTES = 20 * 1024 * 1024  # 20 MB (>= 15 MB requirement
+MAX_SEARCH_RESULTS = 15
+# Allowed office tags in job name/class/workflow (hyphen or space)
+ALLOWED_OFFICE_TOKENS = ("por-str", "por str", "por-mit", "por mit")
 
 
-class AppError(Exception):
-    def __init__(self, status: int, message: str, upstream: int | None = None):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-        self.upstream = upstream
+def is_allowed_office_job(job: dict | str | None) -> bool:
+    """True if job is POR-STR or POR-MIT (case-insensitive; hyphen or space)."""
+    if job is None:
+        return False
+    if isinstance(job, dict):
+        name = str(job.get("name") or "")
+        extras = []
+        for key in ("class_name", "classname", "workflow_name", "workflow", "type_name", "job_type", "tags"):
+            v = job.get(key)
+            if isinstance(v, str):
+                extras.append(v)
+            elif isinstance(v, list):
+                extras.extend(str(x) for x in v)
+            elif isinstance(v, dict):
+                extras.append(str(v.get("name") or ""))
+        hay = " ".join([name] + extras)
+    else:
+        hay = str(job)
+    h = hay.lower()
+    return any(tok in h for tok in ALLOWED_OFFICE_TOKENS)
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+# Back-compat aliases used elsewhere in this file
+def is_por_str_job(job: dict | str | None) -> bool:
+    return is_allowed_office_job(job)
 
 
-OPENER = urllib.request.build_opener(_NoRedirect)
+def require_por_str(job: dict) -> dict | None:
+    """Return job if POR-STR or POR-MIT, else None."""
+    if job and is_allowed_office_job(job):
+        return job
+    return None
 
 
-def redact(text: str) -> str:
-    if not text:
-        return text
-    key = os.environ.get("JOBNIMBUS_API_KEY", "").strip()
-    if key:
-        text = text.replace(key, "[redacted]")
-    return text
 
-
-def api_key() -> str:
-    key = os.environ.get("JOBNIMBUS_API_KEY", "").strip()
+def load_api_key() -> str:
+    """Prefer env JOBNIMBUS_API_KEY; fall back to local secrets file. Never print key."""
+    env_key = os.environ.get("JOBNIMBUS_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        key = API_KEY_PATH.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        raise RuntimeError(
+            "JobNimbus API key missing: set JOBNIMBUS_API_KEY or provide local secrets file"
+        ) from e
     if not key:
-        raise AppError(
-            503,
-            "JobNimbus is not configured. Set JOBNIMBUS_API_KEY on the server.",
-        )
+        raise RuntimeError("JobNimbus API key file is empty")
     return key
 
 
-def _strings_from(value, depth: int = 0):
-    if depth > 4 or value is None:
-        return
-    if isinstance(value, str):
-        text = value.strip()
-        if text:
-            yield text
-        return
-    if isinstance(value, dict):
-        for key in ("name", "workflow_name", "class_name", "label", "title", "value"):
-            if key in value:
-                yield from _strings_from(value.get(key), depth + 1)
-        return
-    if isinstance(value, list):
-        for item in value:
-            yield from _strings_from(item, depth + 1)
-
-
-def identity_texts(job: dict) -> list[str]:
-    texts: list[str] = []
-    for key in IDENTITY_KEYS:
-        texts.extend(_strings_from(job.get(key)))
-    return texts
-
-
-def job_is_allowed(job: dict) -> bool:
-    return any(POR_RE.search(text) for text in identity_texts(job))
-
-
-def job_is_open(job: dict) -> bool:
-    if job.get("is_archived") is True:
-        return False
-    if job.get("is_active") is False:
-        return False
-    return True
-
-
-def first_text(job: dict, *keys: str) -> str:
-    for key in keys:
-        value = job.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def class_name(job: dict) -> str:
-    for key in ("class_name", "class"):
-        for text in _strings_from(job.get(key)):
-            return text
-    return ""
-
-
-def workflow_name(job: dict) -> str:
-    for key in ("workflow_name", "record_type_name", "workflow"):
-        for text in _strings_from(job.get(key)):
-            return text
-    return ""
-
-
-def format_address(job: dict) -> str:
-    line1 = first_text(job, "address_line1", "address_line_1")
-    city = first_text(job, "city")
-    state = first_text(job, "state_text", "state")
-    zip_code = first_text(job, "zip")
-    city_line = " ".join(part for part in (city, state) if part)
-    if zip_code:
-        city_line = (city_line + " " + zip_code).strip()
-    return ", ".join(part for part in (line1, city_line) if part)
-
-
-def public_job(job: dict) -> dict:
-    number = job.get("number")
-    return {
-        "jnid": str(job.get("jnid") or ""),
-        "name": first_text(job, "name"),
-        "number": "" if number is None else str(number),
-        "className": class_name(job),
-        "workflowName": workflow_name(job),
-        "statusName": first_text(job, "status_name"),
-        "address": format_address(job),
-    }
-
-
-def query_matches(job: dict, query: str) -> bool:
-    needle = query.casefold()
-    return any(needle in text.casefold() for text in identity_texts(job))
-
-
-def escape_wildcard(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("*", "\\*").replace("?", "\\?")
-
-
-def wildcard_variants(query: str) -> list[str]:
-    variants: list[str] = []
-    for candidate in (query, query.casefold(), query.upper()):
-        if candidate not in variants:
-            variants.append(candidate)
-    return variants
-
-
-def wildcard_filter(query: str, fields: tuple[str, ...] = SEARCH_FIELDS) -> dict:
-    should = []
-    for variant in wildcard_variants(query):
-        pattern = "*" + escape_wildcard(variant) + "*"
-        for field in fields:
-            should.append({"wildcard": {field: pattern}})
-    return {"must": [{"bool": {"should": should, "minimum_should_match": 1}}]}
-
-
-def http_open(req: urllib.request.Request, timeout: int = JN_TIMEOUT):
-    return OPENER.open(req, timeout=timeout)
-
-
-def jn_request(method: str, path: str, query: dict | None = None, payload: dict | None = None):
-    key = api_key()
-    url = JN_BASE + path.lstrip("/")
-    if query:
-        url += "?" + urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+def jn_request(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
+    """Call JobNimbus API. Returns (status, parsed_json_or_text). Never exposes the key."""
+    key = load_api_key()
+    url = urllib.parse.urljoin(JN_BASE, path.lstrip("/"))
     data = None
     headers = {
         "Authorization": "Bearer " + key,
         "Accept": "application/json",
-        "User-Agent": "PatchEstimator/1.0",
+        "User-Agent": "PatchEstimator-JNBridge/1.0",
     }
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    ctx = ssl.create_default_context()
     try:
-        with http_open(request) as response:
-            raw = response.read()
-            status = getattr(response, "status", 200)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read() if exc.fp is not None else b""
-        status = exc.code
-        if status in (301, 302, 303, 307, 308):
-            raise AppError(502, "JobNimbus redirected the request, so nothing was changed.", status)
-        text = redact(raw.decode("utf-8", "replace"))
-        raise AppError(502, human_jn_error(status, text), status)
-    except urllib.error.URLError:
-        raise AppError(502, "Could not reach JobNimbus. Check the connection and try again.")
-    except TimeoutError:
-        raise AppError(504, "JobNimbus took too long to answer. Try again.")
-    if status < 200 or status >= 300:
-        text = redact(raw.decode("utf-8", "replace"))
-        raise AppError(502, human_jn_error(status, text), status)
-    if not raw:
-        return {}
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+            raw = resp.read()
+            status = resp.getcode()
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        status = e.code
+    except urllib.error.URLError as e:
+        raise RuntimeError("JobNimbus network error: " + str(e.reason)) from e
+
+    text = raw.decode("utf-8", errors="replace") if raw else ""
+    if not text:
+        return status, None
     try:
-        return json.loads(raw.decode("utf-8"))
+        return status, json.loads(text)
     except json.JSONDecodeError:
-        raise AppError(502, "JobNimbus returned a response that was not JSON.")
+        return status, {"raw": text[:500]}
 
 
-def human_jn_error(status: int, body_text: str) -> str:
-    message = ""
-    try:
-        payload = json.loads(body_text) if body_text else {}
-    except json.JSONDecodeError:
-        payload = {}
-    if isinstance(payload, dict):
-        for key in ("message", "error", "detail", "Message"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                message = value.strip()
-                break
-    if status == 401:
-        return "JobNimbus rejected the API key. Check JOBNIMBUS_API_KEY on the server."
-    if status == 403:
-        return "JobNimbus refused this request. The API key may not be allowed to read jobs or attach files."
-    if status == 404:
-        return "JobNimbus could not find that record."
-    if status == 429:
-        return "JobNimbus is busy right now. Wait a moment and try again."
-    if message:
-        return "JobNimbus: " + redact(message)[:300]
-    return "JobNimbus returned an error (%s)." % status
+def escape_wildcard(s: str) -> str:
+    return re.sub(r"([\\*?])", r"\\\1", s)
 
 
-def extract_jobs(payload) -> list[dict]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        for key in ("results", "jobs"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-        if payload.get("jnid") and (payload.get("name") is not None or payload.get("record_type_name") is not None):
-            return [payload]
-    return []
+def _looks_numeric(q: str) -> bool:
+    """True if query is mostly a job number (digits, maybe # or dashes)."""
+    cleaned = q.strip().lstrip("#").replace("-", "").replace(" ", "")
+    return bool(cleaned) and cleaned.isdigit()
 
 
-def extract_file(payload) -> dict:
-    candidate = None
-    if isinstance(payload, dict):
-        files = payload.get("files")
-        if isinstance(files, list) and files and isinstance(files[0], dict):
-            candidate = files[0]
-        elif payload.get("jnid") and payload.get("filename"):
-            candidate = payload
-    if not candidate:
-        return {"jnid": "", "filename": ""}
-    return {
-        "jnid": str(candidate.get("jnid") or ""),
-        "filename": str(candidate.get("filename") or ""),
-    }
+def _job_address_line1(j: dict) -> str:
+    for key in ("address_line1", "address_line_1", "street", "address1"):
+        v = j.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    addr = j.get("address")
+    if isinstance(addr, dict):
+        for key in ("line1", "address_line1", "street", "address1"):
+            v = addr.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(addr, str) and addr.strip():
+        return addr.strip().split("\n", 1)[0].strip()
+    return ""
 
 
-def _search_page(query_text: str, filt: dict, size: int, offset: int) -> list[dict]:
-    payload = jn_request(
-        "GET",
-        "jobs",
-        query={
-            "size": str(size),
-            "from": str(offset),
-            "sort_field": "date_updated",
-            "sort_direction": "desc",
-            "filter": json.dumps(filt, separators=(",", ":")),
-        },
-    )
-    return extract_jobs(payload)
+def _job_status_name(j: dict) -> str:
+    for key in ("status_name", "statusName"):
+        v = j.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    status = j.get("status")
+    if isinstance(status, dict):
+        name = status.get("name") or status.get("status_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    if isinstance(status, str) and status.strip() and not status.isdigit():
+        return status.strip()
+    return ""
 
 
-def search_jobs_raw(query_text: str, size: int = 25, pages: int = 1) -> list[dict]:
-    filters = [wildcard_filter(query_text)]
-    collected: list[dict] = []
-    seen: set[str] = set()
-
-    def absorb(batch: list[dict]) -> None:
-        for job in batch:
-            jnid = str(job.get("jnid") or "")
-            if jnid and jnid in seen:
-                continue
-            if jnid:
-                seen.add(jnid)
-            collected.append(job)
-
-    try:
-        for page in range(pages):
-            batch = _search_page(query_text, filters[0], size, page * size)
-            absorb(batch)
-            if len(batch) < size:
-                break
-        return collected
-    except AppError as exc:
-        if exc.upstream != 400:
-            raise
-        collected.clear()
-        seen.clear()
-
-    for field in SEARCH_FIELDS:
-        simple = wildcard_filter(query_text, (field,))
-        try:
-            batch = _search_page(query_text, simple, size, 0)
-        except AppError as exc:
-            if exc.upstream == 400 and field != SEARCH_FIELDS[-1] and not collected:
-                continue
-            if collected:
-                break
-            raise
-        absorb(batch)
-    return collected
-
-
-def search_jobs_public(query_text: str) -> list[dict]:
-    query_text = query_text.strip()
-    if len(query_text) < 2:
-        raise AppError(400, "Type at least 2 characters to search jobs.")
-    if len(query_text) > 80:
-        raise AppError(400, "That search is too long. Use a shorter job name.")
-    if any(ord(ch) < 32 for ch in query_text):
-        raise AppError(400, "That search has characters that cannot be used.")
-    public = []
-    for job in search_jobs_raw(query_text, size=25, pages=1):
-        if not job_is_open(job) or not job_is_allowed(job) or not query_matches(job, query_text):
-            continue
-        item = public_job(job)
-        if not item["jnid"] or not item["name"]:
-            continue
-        public.append(item)
-        if len(public) >= 20:
-            break
-    return public
-
-
-def fetch_job(jnid: str) -> dict:
-    payload = jn_request("GET", "jobs/" + urllib.parse.quote(jnid, safe=""))
-    jobs = extract_jobs(payload)
-    if isinstance(payload, dict) and payload.get("jnid") and not jobs:
-        return payload
-    if not jobs:
-        raise AppError(404, "JobNimbus could not find that job.")
-    return jobs[0]
-
-
-def resolve_job_by_name(job_name: str) -> dict:
-    found = search_jobs_raw(job_name, size=50, pages=3)
-    allowed = []
-    seen: set[str] = set()
-    for job in found:
-        if not job_is_open(job) or not job_is_allowed(job):
-            continue
-        jnid = str(job.get("jnid") or "")
-        if jnid and jnid in seen:
-            continue
-        if jnid:
-            seen.add(jnid)
-        allowed.append(job)
-    target = job_name.strip().casefold()
-    exact = [job for job in allowed if first_text(job, "name").casefold() == target]
-    if len(exact) == 1:
-        return exact[0]
-    if len(exact) > 1:
-        raise AppError(
-            409,
-            "More than one POR-STR or POR-MIT job has that exact name. Pick the job from the list.",
-        )
-    contains = [job for job in allowed if target in first_text(job, "name").casefold()]
-    if len(contains) == 1:
-        return contains[0]
-    if not contains:
-        raise AppError(
-            404,
-            "No POR-STR or POR-MIT job matches that name. A job was not created.",
-        )
-    raise AppError(
-        409,
-        "Several POR-STR or POR-MIT jobs contain that name. Pick the job from the list.",
-    )
-
-
-def decode_pdf(pdf_base64: str) -> bytes:
-    raw = pdf_base64.strip()
-    if raw.lower().startswith("data:"):
-        raw = raw.split(",", 1)[-1]
-    raw = re.sub(r"\s+", "", raw)
-    try:
-        data = base64.b64decode(raw, validate=True)
-    except Exception:
-        raise AppError(400, "The PDF data is not valid base64.")
-    if not data.startswith(b"%PDF"):
-        raise AppError(400, "That file is not a PDF.")
-    if len(data) > 15 * 1024 * 1024:
-        raise AppError(413, "The PDF is too large to attach. Keep it under about 15 MB.")
-    return data
-
-
-def safe_filename(filename: str) -> str:
-    base = os.path.basename(filename or "").replace("\x00", "")
-    base = re.sub(r"[^\w.\- ()]+", "", base, flags=re.UNICODE)
-    base = re.sub(r"\s+", " ", base).strip(" .")
-    if not base:
-        raise AppError(400, "Give the PDF a file name.")
-    if not base.lower().endswith(".pdf"):
-        base += ".pdf"
-    if len(base) > 140:
-        stem = base[:-4]
-        base = stem[:130].rstrip() + ".pdf"
-    return base
-
-
-def attach_pdf(job: dict, filename: str, pdf_bytes: bytes, job_name: str) -> dict:
-    jnid = str(job.get("jnid") or "")
+def normalize_job(j: dict) -> dict | None:
+    if not isinstance(j, dict):
+        return None
+    jnid = j.get("jnid") or j.get("id")
     if not jnid:
-        raise AppError(502, "JobNimbus did not return an id for that job.")
-    payload = {
-        "data": base64.b64encode(pdf_bytes).decode("ascii"),
-        "filename": filename,
-        "type": 1,
-        "related": [jnid],
-        "subtype": "job",
-        "persist": True,
-        "is_private": False,
-        "description": "Patch estimate for %s" % (first_text(job, "name") or job_name),
-        "date": int(time.time()),
+        return None
+    out = {
+        "jnid": str(jnid),
+        "name": str(j.get("name") or ""),
+        "number": str(j.get("number") or j.get("display_number") or ""),
     }
-    # Files are attached to an existing job. There is no create-job call.
-    result = jn_request("POST", "files", payload=payload)
-    return extract_file(result)
+    status_name = _job_status_name(j)
+    if status_name:
+        out["status_name"] = status_name
+    address_line1 = _job_address_line1(j)
+    if address_line1:
+        out["address_line1"] = address_line1
+    return out
 
 
-def send_estimate(body: dict) -> dict:
-    if not isinstance(body, dict):
-        raise AppError(400, "The request was not a JSON object.")
-    job_name = str(body.get("jobName") or "").strip()
-    filename = str(body.get("filename") or "").strip()
-    pdf_base64 = body.get("pdfBase64")
-    job_jnid = str(body.get("jobJnid") or "").strip()
-    if not job_name:
-        raise AppError(400, "Enter a job name before sending.")
-    if not filename:
-        raise AppError(400, "Give the PDF a file name.")
-    if not isinstance(pdf_base64, str) or not pdf_base64.strip():
-        raise AppError(400, "The PDF was empty. Create it again, then send.")
-    pdf_bytes = decode_pdf(pdf_base64)
-    filename = safe_filename(filename)
-    if job_jnid:
-        if not JNID_RE.match(job_jnid):
-            raise AppError(400, "That job id is not valid. Pick the job from the list again.")
-        job = fetch_job(job_jnid)
-        if not job_is_allowed(job):
-            raise AppError(
-                403,
-                "That job is not a POR-STR or POR-MIT job, so the PDF was not attached.",
+def _jn_jobs_query(filt: dict, size: int = 25) -> list[dict]:
+    qs = urllib.parse.urlencode(
+        {"size": str(size), "filter": json.dumps(filt, separators=(",", ":"))}
+    )
+    status, payload = jn_request("GET", "jobs?" + qs)
+    if status >= 400:
+        raise RuntimeError(f"JobNimbus job search failed (HTTP {status})")
+    results = []
+    if isinstance(payload, dict):
+        results = payload.get("results") or payload.get("jobs") or []
+    if not isinstance(results, list):
+        results = []
+    return [r for r in results if isinstance(r, dict)]
+
+
+def search_jobs(query: str, *, for_autocomplete: bool = False) -> list[dict]:
+    """Search JN jobs by name (wildcard contains). Optionally also by number.
+
+    Only returns POR-STR or POR-MIT jobs (name/class/workflow).
+    No server-side job list cache — every call hits JobNimbus live.
+    Dedupes by jnid. When for_autocomplete, includes status_name / address_line1
+    and sorts: exact name → starts-with → contains (then by name).
+    """
+    name = query.strip()
+    if not name:
+        return []
+
+    escaped = escape_wildcard(name)
+    by_id: dict[str, dict] = {}
+
+    def ingest(raw_list: list[dict]) -> None:
+        for j in raw_list:
+            # Filter early using raw JN fields (class/workflow) + name
+            if not is_por_str_job(j):
+                continue
+            norm = normalize_job(j)
+            if not norm:
+                continue
+            if not is_por_str_job(norm):
+                continue
+            # Prefer richer record if we already have a stub
+            prev = by_id.get(norm["jnid"])
+            if prev is None or (
+                (norm.get("status_name") or norm.get("address_line1"))
+                and not (prev.get("status_name") or prev.get("address_line1"))
+            ):
+                by_id[norm["jnid"]] = norm
+            elif prev is not None:
+                # keep existing, fill missing fields
+                for k in ("status_name", "address_line1", "number", "name"):
+                    if not prev.get(k) and norm.get(k):
+                        prev[k] = norm[k]
+
+    # Primary: name contains query AND (POR-STR or POR-MIT)
+    por_str_esc = escape_wildcard("POR-STR")
+    por_mit_esc = escape_wildcard("POR-MIT")
+    filt = {
+        "must": [
+            {"wildcard": {"name": f"*{escaped}*"}},
+            {
+                "bool": {
+                    "should": [
+                        {"wildcard": {"name": f"*{por_str_esc}*"}},
+                        {"wildcard": {"name": f"*{por_mit_esc}*"}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+        ]
+    }
+    ingest(_jn_jobs_query(filt, size=25))
+
+    # Case-folded retry if empty and letters present
+    if not by_id and name != name.lower():
+        filt2 = {
+            "must": [
+                {"wildcard": {"name": f"*{escape_wildcard(name.lower())}*"}},
+                {
+                    "bool": {
+                        "should": [
+                            {"wildcard": {"name": f"*{por_str_esc}*"}},
+                            {"wildcard": {"name": f"*{por_mit_esc}*"}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+            ]
+        }
+        ingest(_jn_jobs_query(filt2, size=25))
+
+    # If still empty, broaden: query match then client-filter POR-STR/POR-MIT
+    # (covers office tag living only in class/workflow, not name)
+    if not by_id:
+        filt3 = {"must": [{"wildcard": {"name": f"*{escaped}*"}}]}
+        ingest(_jn_jobs_query(filt3, size=40))
+
+    # Number match when query looks numeric
+    if _looks_numeric(name):
+        num = name.strip().lstrip("#").strip()
+        num_esc = escape_wildcard(num)
+        # try exact-ish and contains on number field
+        for filt_n in (
+            {"must": [{"term": {"number": num}}]},
+            {"must": [{"wildcard": {"number": f"*{num_esc}*"}}]},
+        ):
+            try:
+                ingest(_jn_jobs_query(filt_n, size=15))
+            except RuntimeError:
+                # term may not be supported the same way — continue
+                continue
+
+    jobs = [j for j in by_id.values() if is_por_str_job(j)]
+
+    if for_autocomplete or True:
+        needle_l = name.lower()
+
+        def sort_key(j: dict) -> tuple:
+            n = (j.get("name") or "").lower()
+            num = (j.get("number") or "").lower()
+            exact = 0 if n == needle_l else 1
+            starts = 0 if n.startswith(needle_l) else 1
+            # number exact boost when numeric query
+            num_exact = 0 if num == needle_l or num == name.strip().lstrip("#").lower() else 1
+            contains = 0 if needle_l in n else 1
+            return (exact, starts, num_exact, contains, n)
+
+        jobs.sort(key=sort_key)
+
+    if for_autocomplete:
+        jobs = jobs[:MAX_SEARCH_RESULTS]
+
+    return jobs
+
+
+def fetch_job(jnid: str) -> dict | None:
+    """Fetch a single job by jnid for confirmation."""
+    jnid = (jnid or "").strip()
+    if not jnid:
+        return None
+    status, payload = jn_request("GET", "jobs/" + urllib.parse.quote(jnid, safe=""))
+    if status >= 400:
+        # Fallback: filter by jnid
+        filt = {"must": [{"term": {"jnid": jnid}}]}
+        try:
+            qs = urllib.parse.urlencode(
+                {"size": "1", "filter": json.dumps(filt, separators=(",", ":"))}
             )
-    else:
-        job = resolve_job_by_name(job_name)
-    attached = attach_pdf(job, filename, pdf_bytes, job_name)
-    canonical = first_text(job, "name") or job_name
-    return {
-        "ok": True,
-        "message": "Attached %s to %s in JobNimbus." % (filename, canonical),
-        "job": {"jnid": str(job.get("jnid") or ""), "name": canonical},
-        "file": attached,
-    }
-
-
-def resolve_public(url_path: str) -> str | None:
-    path = urllib.parse.unquote(url_path.split("?", 1)[0])
-    if path in ("", "/"):
-        path = "/index.html"
-    if "\x00" in path:
+            status2, payload2 = jn_request("GET", "jobs?" + qs)
+            if status2 < 400 and isinstance(payload2, dict):
+                results = payload2.get("results") or payload2.get("jobs") or []
+                if isinstance(results, list) and results:
+                    return normalize_job(results[0])
+        except Exception:
+            pass
         return None
-    path = path.lstrip("/")
-    if path.endswith("/"):
-        path += "index.html"
-    parts = path.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        return None
-    full = os.path.normpath(os.path.join(PUBLIC_DIR, *parts))
-    public_root = os.path.normpath(PUBLIC_DIR)
-    if full != public_root and not full.startswith(public_root + os.sep):
-        return None
-    if os.path.isfile(full):
-        return full
+    if isinstance(payload, dict):
+        # Sometimes wrapped
+        if "jnid" in payload or "id" in payload:
+            return normalize_job(payload)
+        inner = payload.get("job") or payload.get("data")
+        if isinstance(inner, dict):
+            return normalize_job(inner)
     return None
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "PatchEstimator/1.0"
+def resolve_job(job_name: str) -> dict:
+    """Prefer exact case-insensitive match; else unique contains; else error dict."""
+    needle = job_name.strip()
+    needle_l = needle.lower()
+    jobs = search_jobs(needle, for_autocomplete=False)
+    if not jobs:
+        return {
+            "ok": False,
+            "error": "not_found",
+            "message": "No POR-STR / POR-MIT JobNimbus job found matching that name. Pick one from the list (e.g. Name (POR-STR) or Name (POR-MIT)).",
+        }
 
-    def log_message(self, fmt, *args):
-        code = args[1] if len(args) > 1 else "-"
-        path = urllib.parse.urlparse(self.path).path
-        sys.stderr.write("%s %s %s\n" % (self.command, path, code))
+    exact = [j for j in jobs if j["name"].lower() == needle_l]
+    if len(exact) == 1:
+        return {"ok": True, "job": exact[0]}
+    if len(exact) > 1:
+        return {
+            "ok": False,
+            "error": "multiple_jobs",
+            "message": f"Multiple POR-STR / POR-MIT jobs named “{needle}”. Pick one from the autocomplete list.",
+            "jobs": [{"jnid": j["jnid"], "name": j["name"], "number": j["number"]} for j in exact],
+        }
 
-    def _cors(self):
+    contains = [j for j in jobs if needle_l in j["name"].lower()]
+    if len(contains) == 1:
+        return {"ok": True, "job": contains[0]}
+    if len(contains) == 0:
+        if len(jobs) == 1:
+            return {"ok": True, "job": jobs[0]}
+        return {
+            "ok": False,
+            "error": "multiple_jobs",
+            "message": "Multiple POR-STR / POR-MIT jobs matched. Pick one from the autocomplete list.",
+            "jobs": [{"jnid": j["jnid"], "name": j["name"], "number": j["number"]} for j in jobs],
+        }
+    return {
+        "ok": False,
+        "error": "multiple_jobs",
+        "message": f"Multiple POR-STR / POR-MIT jobs match “{needle}”. Pick one from the autocomplete list.",
+        "jobs": [{"jnid": j["jnid"], "name": j["name"], "number": j["number"]} for j in contains],
+    }
+
+
+def attach_pdf(job: dict, filename: str, pdf_b64: str) -> dict:
+    # Strip data-URL prefix if present
+    b64 = pdf_b64.strip()
+    if "," in b64 and b64.lower().startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    # Validate base64 lightly
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as e:
+        raise ValueError("Invalid pdfBase64") from e
+    if len(raw) < 5:
+        raise ValueError("PDF payload too small")
+
+    safe_name = filename.strip() or "Patch-Estimate.pdf"
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name += ".pdf"
+    # Keep filename filesystem-ish
+    safe_name = re.sub(r"[^\w.\- ()]+", "_", safe_name)[:120]
+
+    body = {
+        "data": b64,
+        "filename": safe_name,
+        "description": "Patch estimate",
+        "related": [job["jnid"]],
+        "subtype": "job",
+        "type": 1,
+        "persist": True,
+        "is_private": False,
+    }
+    status, payload = jn_request("POST", "files", body)
+    if status >= 400:
+        msg = "JobNimbus file upload failed"
+        if isinstance(payload, dict):
+            msg = str(payload.get("message") or payload.get("error") or msg)
+        raise RuntimeError(f"{msg} (HTTP {status})")
+
+    file_jnid = None
+    if isinstance(payload, dict):
+        file_jnid = payload.get("jnid") or payload.get("id")
+        if not file_jnid and isinstance(payload.get("file"), dict):
+            file_jnid = payload["file"].get("jnid")
+    return {
+        "ok": True,
+        "job": {"jnid": job["jnid"], "name": job["name"], "number": job["number"]},
+        "fileJnid": file_jnid,
+    }
+
+
+def err_message(error: str, fallback: str | None = None) -> str:
+    messages = {
+        "not_found": "No POR-STR / POR-MIT JobNimbus job found matching that name.",
+        "multiple_jobs": "Multiple POR-STR / POR-MIT jobs matched. Pick one from the list.",
+        "not_por_str": "Only POR-STR or POR-MIT jobs are allowed. Pick a job whose name includes POR-STR or POR-MIT.",
+        "missing_job_name": "Enter a job name (or pick a job from the list).",
+        "missing_pdf": "Missing PDF data.",
+        "invalid_json": "Invalid request body.",
+        "empty_body": "Empty request body.",
+        "payload_too_large": "PDF payload is too large (max ~15–20 MB).",
+        "invalid_pdf": "Invalid PDF data.",
+        "job_not_found": "That JobNimbus job was not found (it may have been deleted).",
+        "missing_job": "Provide a job name or select a job from the list.",
+        "not_found_endpoint": "Unknown API endpoint.",
+        "server_error": "Server error. Try again.",
+        "jobnimbus_error": "JobNimbus request failed.",
+        "q_too_short": "Type at least 2 characters to search.",
+    }
+    return messages.get(error) or fallback or error
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, fmt: str, *args) -> None:
+        # Avoid echoing request bodies / secrets
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Max-Age", "600")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
-    def send_json(self, status: int, payload: dict):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self._cors()
+    def _json(self, code: int, obj: dict) -> None:
+        if not obj.get("message") and obj.get("error") and not obj.get("ok"):
+            obj = dict(obj)
+            obj["message"] = err_message(str(obj["error"]))
+        raw = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def send_file(self, full_path: str):
-        ext = os.path.splitext(full_path)[1].lower()
-        mime = MIME.get(ext, "application/octet-stream")
-        with open(full_path, "rb") as handle:
-            data = handle.read()
-        self.send_response(200)
+        self.send_header("Content-Length", str(len(raw)))
         self._cors()
-        self.send_header("Content-Type", mime)
-        if os.path.basename(full_path) == "sw.js":
-            self.send_header("Cache-Control", "no-cache")
-        else:
-            self.send_header("Cache-Control", "public, max-age=300")
-        self.send_header("Content-Length", str(len(data)))
+        # Never cache job search / send responses — new POR-STR / POR-MIT jobs must appear live
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(raw)
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path in (SEND_PATH, JOBS_PATH):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-    def do_GET(self):
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/api/jobnimbus/jobs":
-                params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                query = (params.get("q") or [""])[0]
-                jobs = search_jobs_public(query)
-                self.send_json(200, {"ok": True, "jobs": jobs})
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == JOBS_PATH:
+            qs = urllib.parse.parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0]
+            if not isinstance(q, str):
+                q = str(q)
+            q = q.strip()
+            if len(q) < 2:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "q_too_short",
+                        "message": err_message("q_too_short"),
+                        "jobs": [],
+                    },
+                )
                 return
-            if parsed.path.startswith("/api/"):
-                self.send_json(404, {"ok": False, "error": "That API path does not exist."})
-                return
-            full = resolve_public(parsed.path)
-            if not full:
-                self.send_json(404, {"ok": False, "error": "That file was not found."})
-                return
-            self.send_file(full)
-        except AppError as exc:
-            self.send_json(exc.status, {"ok": False, "error": redact(exc.message)})
-        except Exception:
-            sys.stderr.write(redact(traceback.format_exc()))
-            self.send_json(500, {"ok": False, "error": "Something went wrong on the server. Try again."})
+            try:
+                jobs = search_jobs(q, for_autocomplete=True)
+                self._json(200, {"ok": True, "jobs": jobs})
+            except RuntimeError as e:
+                self._json(
+                    502,
+                    {
+                        "ok": False,
+                        "error": "jobnimbus_error",
+                        "message": str(e),
+                        "jobs": [],
+                    },
+                )
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                self._json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "server_error",
+                        "message": err_message("server_error"),
+                        "jobs": [],
+                    },
+                )
+            return
+        # Static files
+        super().do_GET()
 
-    def do_POST(self):
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != "/api/jobnimbus/send":
-                self.send_json(404, {"ok": False, "error": "That API path does not exist."})
-                return
-            length_header = self.headers.get("Content-Length")
-            if length_header is None:
-                raw = self.rfile.read(MAX_BODY + 1)
-                if len(raw) > MAX_BODY:
-                    self.close_connection = True
-                    self.send_json(
-                        413,
-                        {"ok": False, "error": "The upload is over the 20 MB limit. Use a smaller PDF."},
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+
+        # Optional POST search (same as GET)
+        if path == JOBS_PATH:
+            length = int(self.headers.get("Content-Length") or 0)
+            q = ""
+            if length > 0 and length <= 64 * 1024:
+                try:
+                    raw = self.rfile.read(length)
+                    data = json.loads(raw.decode("utf-8"))
+                    if isinstance(data, dict):
+                        q = (data.get("q") or data.get("query") or "").strip()
+                        if not isinstance(q, str):
+                            q = str(q)
+                except Exception:
+                    self._json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "invalid_json",
+                            "message": err_message("invalid_json"),
+                            "jobs": [],
+                        },
                     )
                     return
             else:
-                try:
-                    length = int(length_header)
-                except ValueError:
-                    raise AppError(400, "The request size was not valid.")
-                if length < 0:
-                    raise AppError(400, "The request size was not valid.")
-                if length > MAX_BODY:
-                    self.close_connection = True
-                    self.send_json(
-                        413,
-                        {"ok": False, "error": "The upload is over the 20 MB limit. Use a smaller PDF."},
+                # also allow ?q= on POST
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                q = (qs.get("q") or [""])[0]
+            q = (q or "").strip()
+            if len(q) < 2:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "q_too_short",
+                        "message": err_message("q_too_short"),
+                        "jobs": [],
+                    },
+                )
+                return
+            try:
+                jobs = search_jobs(q, for_autocomplete=True)
+                self._json(200, {"ok": True, "jobs": jobs})
+            except RuntimeError as e:
+                self._json(
+                    502,
+                    {"ok": False, "error": "jobnimbus_error", "message": str(e), "jobs": []},
+                )
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                self._json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "server_error",
+                        "message": err_message("server_error"),
+                        "jobs": [],
+                    },
+                )
+            return
+
+        if path != SEND_PATH:
+            self._json(
+                404,
+                {
+                    "ok": False,
+                    "error": "not_found_endpoint",
+                    "message": err_message("not_found_endpoint"),
+                },
+            )
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._json(
+                400,
+                {"ok": False, "error": "empty_body", "message": err_message("empty_body")},
+            )
+            return
+        if length > MAX_BODY_BYTES:
+            self._json(
+                413,
+                {
+                    "ok": False,
+                    "error": "payload_too_large",
+                    "message": err_message("payload_too_large"),
+                },
+            )
+            return
+        try:
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._json(
+                400,
+                {"ok": False, "error": "invalid_json", "message": err_message("invalid_json")},
+            )
+            return
+
+        if not isinstance(data, dict):
+            self._json(
+                400,
+                {"ok": False, "error": "invalid_json", "message": err_message("invalid_json")},
+            )
+            return
+
+        job_name = (
+            (data.get("jobName") or "").strip()
+            if isinstance(data.get("jobName"), str)
+            else ""
+        )
+        job_jnid = (
+            (data.get("jobJnid") or data.get("jnid") or "").strip()
+            if isinstance(data.get("jobJnid") or data.get("jnid"), str)
+            else ""
+        )
+        pdf_b64 = data.get("pdfBase64") or ""
+        if not isinstance(pdf_b64, str):
+            pdf_b64 = ""
+        filename = (
+            data.get("filename")
+            if isinstance(data.get("filename"), str)
+            else "Patch-Estimate.pdf"
+        )
+
+        if not job_jnid and not job_name:
+            self._json(
+                400,
+                {
+                    "ok": False,
+                    "error": "missing_job",
+                    "message": err_message("missing_job"),
+                },
+            )
+            return
+        if not pdf_b64.strip():
+            self._json(
+                400,
+                {"ok": False, "error": "missing_pdf", "message": err_message("missing_pdf")},
+            )
+            return
+
+        try:
+            if job_jnid:
+                job = fetch_job(job_jnid)
+                if not job:
+                    self._json(
+                        404,
+                        {
+                            "ok": False,
+                            "error": "job_not_found",
+                            "message": err_message("job_not_found"),
+                        },
                     )
                     return
-                raw = self.rfile.read(length)
-            try:
-                body = json.loads(raw.decode("utf-8-sig"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise AppError(400, "The request was not valid JSON.")
-            self.send_json(200, send_estimate(body))
-        except AppError as exc:
-            self.send_json(exc.status, {"ok": False, "error": redact(exc.message)})
+                # Prefer client-supplied name for display if fetch returned empty name
+                if not job.get("name") and job_name:
+                    job["name"] = job_name
+                if not is_por_str_job(job):
+                    self._json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "not_por_str",
+                            "message": err_message("not_por_str"),
+                        },
+                    )
+                    return
+                result = attach_pdf(job, filename, pdf_b64)
+                self._json(200, result)
+                return
+
+            resolved = resolve_job(job_name)
+            if not resolved.get("ok"):
+                code = 404 if resolved.get("error") == "not_found" else 409
+                if not resolved.get("message"):
+                    resolved = dict(resolved)
+                    resolved["message"] = err_message(str(resolved.get("error") or ""))
+                self._json(code, resolved)
+                return
+            result = attach_pdf(resolved["job"], filename, pdf_b64)
+            self._json(200, result)
+        except ValueError as e:
+            self._json(
+                400,
+                {
+                    "ok": False,
+                    "error": "invalid_pdf",
+                    "message": str(e) or err_message("invalid_pdf"),
+                },
+            )
+        except RuntimeError as e:
+            # Never include auth details
+            self._json(
+                502,
+                {"ok": False, "error": "jobnimbus_error", "message": str(e)},
+            )
         except Exception:
-            sys.stderr.write(redact(traceback.format_exc()))
-            self.send_json(500, {"ok": False, "error": "Something went wrong on the server. Try again."})
+            traceback.print_exc(file=sys.stderr)
+            self._json(
+                500,
+                {
+                    "ok": False,
+                    "error": "server_error",
+                    "message": err_message("server_error"),
+                },
+            )
 
-    def do_PUT(self):
-        self.send_json(405, {"ok": False, "error": "That method is not supported."})
 
-    def do_DELETE(self):
-        self.send_json(405, {"ok": False, "error": "That method is not supported."})
+def main() -> None:
+    if not ROOT.is_dir():
+        print(f"Static root missing: {ROOT}", file=sys.stderr)
+        sys.exit(1)
+    # Fail fast if key missing (do not print key)
+    try:
+        load_api_key()
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
-
-def main():
-    if not os.environ.get("JOBNIMBUS_API_KEY", "").strip():
-        print(
-            "JOBNIMBUS_API_KEY is not set. The estimator will load, but JobNimbus calls fail until it is set.",
-            file=sys.stderr,
-        )
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("Patch Estimator listening on %s:%s" % (HOST, PORT), flush=True)
+    # Allow large request bodies (default is fine; documented for operators)
+    print(f"Patch Estimator + JN bridge on http://{HOST}:{PORT}/", flush=True)
+    print(f"Static root: {ROOT}", flush=True)
+    print(f"GET  {JOBS_PATH}?q=", flush=True)
+    print(f"POST {SEND_PATH} (optional jobJnid)", flush=True)
+    print(f"Max body: {MAX_BODY_BYTES} bytes", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("Shutting down.", flush=True)
-    finally:
+        print("\nShutting down.", flush=True)
         server.server_close()
 
 

@@ -1,121 +1,184 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#123055">
-  <meta name="robots" content="noindex, nofollow">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="Patch Estimator">
-  <title>Patch Estimator — 24 Hour Flood Pros</title>
-  <link rel="manifest" href="manifest.webmanifest">
-  <link rel="icon" href="icons/icon-32.png" sizes="32x32">
-  <link rel="apple-touch-icon" href="icons/icon-180.png">
-  <link rel="stylesheet" href="app.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b3d5c" />
+  <meta name="description" content="Patch Estimator for 24 Hour Flood Pros — drywall and all-inclusive patch quotes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Patch Estimator" />
+  <link rel="manifest" href="manifest.webmanifest?v=13" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+  <link rel="apple-touch-icon" href="icon-180.png" />
+  <title>Patch Estimator | 24 Hour Flood Pros</title>
+  <link rel="stylesheet" href="styles.css?v=13" />
 </head>
 <body>
-  <header class="top">
+  <header class="header">
     <div class="brand">
-      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
-        <rect x="4" y="4" width="40" height="40" rx="8" fill="#f0b429"/>
-        <rect x="10" y="10" width="28" height="28" rx="4" fill="#fffaf2"/>
-        <rect x="20" y="18" width="16" height="16" rx="2" fill="#123055"/>
-      </svg>
+      <img src="icon.svg" alt="" class="brand-icon" width="40" height="40" />
       <div>
-        <p class="company">24 Hour Flood Pros</p>
         <h1>Patch Estimator</h1>
+        <p class="subtitle">24 Hour Flood Pros</p>
       </div>
     </div>
-    <p class="grand" id="grand-total" data-cents="74600">$746.00</p>
   </header>
 
-  <main>
-    <section class="card" id="job-card">
-      <div class="label-row">
-        <label for="job-search">Job</label>
-        <button type="button" id="job-clear" class="text-button" hidden>Clear</button>
+  <main class="main">
+    <!-- Job (top) -->
+    <section class="card" aria-labelledby="job-label">
+      <h2 id="job-label" class="section-title">Job</h2>
+      <div class="field job-autocomplete">
+        <label for="job-name"><span>Job name</span></label>
+        <div class="job-ac-wrap">
+          <input type="text" id="job-name" autocomplete="off" placeholder="Search POR-STR / POR-MIT jobs…" aria-label="Job name" aria-autocomplete="list" aria-controls="job-ac-list" aria-expanded="false" />
+          <span id="job-ac-status" class="job-ac-status hidden" aria-live="polite"></span>
+          <ul id="job-ac-list" class="job-ac-list hidden" role="listbox" aria-label="Matching JobNimbus jobs"></ul>
+        </div>
+        <p class="hint tight" id="job-ac-hint">POR-STR and POR-MIT jobs — type a name, pick from the list, then Send.</p>
       </div>
-      <p class="hint">POR-STR and POR-MIT only. The list is live from JobNimbus.</p>
-      <div class="job-field">
-        <input id="job-search" type="search" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Search job name, class, or workflow" aria-autocomplete="list" aria-controls="job-menu" aria-expanded="false">
-        <div id="job-menu" class="job-menu" role="listbox" hidden></div>
-      </div>
-      <p id="job-selected" class="selected" hidden></p>
     </section>
 
-    <section class="card">
-      <h2>Price sheet</h2>
-      <p class="hint">One sheet for the whole estimate. Drywall and all-inclusive prices are never blended.</p>
-      <div class="sheets" role="group" aria-label="Price sheet">
-        <button type="button" id="sheet-drywall" class="sheet" aria-pressed="true">
+    <!-- Sheet toggle -->
+    <section class="card" aria-labelledby="sheet-label">
+      <h2 id="sheet-label" class="section-title">Price sheet</h2>
+      <div class="segmented" role="radiogroup" aria-label="Price sheet">
+        <button type="button" class="seg-btn active" data-sheet="drywall" role="radio" aria-checked="true" id="sheet-drywall">
           Drywall only
-          <span>Base $746.00</span>
         </button>
-        <button type="button" id="sheet-allin" class="sheet" aria-pressed="false">
+        <button type="button" class="seg-btn" data-sheet="inclusive" role="radio" aria-checked="false" id="sheet-inclusive">
           All-inclusive
-          <span>Base $1,040.00</span>
         </button>
       </div>
-      <ul id="rate-legend" class="legend"></ul>
-      <p class="hint">Each patch is priced on its own. 100 SF and under uses the inspect-locked each price. Over 100 SF is a custom $ per SF with no inspect lock.</p>
+      <p class="hint" id="sheet-hint">Base $746 · per patch · paint add-on available</p>
     </section>
 
-    <section class="card">
-      <div class="section-head">
-        <h2>Patches</h2>
-        <button type="button" id="add-patch" class="secondary">Add patch</button>
+    <!-- SF tier counters -->
+    <section class="card" aria-labelledby="counts-label">
+      <h2 id="counts-label" class="section-title">Patch counts (price sheet tiers)</h2>
+      <p class="hint tight">Each counted item is its own patch, priced <strong>each</strong> at that tier’s sheet rate. Base is once per job. Sheets never blend.</p>
+      <div class="counters">
+        <div class="counter-row" data-key="under10">
+          <div class="counter-label">
+            <span class="counter-name">Under 10 SF</span>
+            <span class="counter-sf" id="price-hint-under10">$97 each</span>
+          </div>
+          <div class="stepper">
+            <button type="button" class="step-btn" data-action="dec" data-key="under10" aria-label="Decrease under 10 SF">−</button>
+            <input type="number" class="step-value" id="count-under10" value="0" min="0" max="999" inputmode="numeric" aria-label="Under 10 SF count" />
+            <button type="button" class="step-btn" data-action="inc" data-key="under10" aria-label="Increase under 10 SF">+</button>
+          </div>
+        </div>
+        <div class="counter-row" data-key="t10_30">
+          <div class="counter-label">
+            <span class="counter-name">10 SF – 30 SF</span>
+            <span class="counter-sf" id="price-hint-t10_30">$136 each</span>
+          </div>
+          <div class="stepper">
+            <button type="button" class="step-btn" data-action="dec" data-key="t10_30" aria-label="Decrease 10–30 SF">−</button>
+            <input type="number" class="step-value" id="count-t10_30" value="0" min="0" max="999" inputmode="numeric" aria-label="10 to 30 SF count" />
+            <button type="button" class="step-btn" data-action="inc" data-key="t10_30" aria-label="Increase 10–30 SF">+</button>
+          </div>
+        </div>
+        <div class="counter-row" data-key="t30_50">
+          <div class="counter-label">
+            <span class="counter-name">30 SF – 50 SF</span>
+            <span class="counter-sf" id="price-hint-t30_50">$190 each</span>
+          </div>
+          <div class="stepper">
+            <button type="button" class="step-btn" data-action="dec" data-key="t30_50" aria-label="Decrease 30–50 SF">−</button>
+            <input type="number" class="step-value" id="count-t30_50" value="0" min="0" max="999" inputmode="numeric" aria-label="30 to 50 SF count" />
+            <button type="button" class="step-btn" data-action="inc" data-key="t30_50" aria-label="Increase 30–50 SF">+</button>
+          </div>
+        </div>
+        <div class="counter-row" data-key="t50_100">
+          <div class="counter-label">
+            <span class="counter-name">50 SF – 100 SF</span>
+            <span class="counter-sf" id="price-hint-t50_100">$266 each</span>
+          </div>
+          <div class="stepper">
+            <button type="button" class="step-btn" data-action="dec" data-key="t50_100" aria-label="Decrease 50–100 SF">−</button>
+            <input type="number" class="step-value" id="count-t50_100" value="0" min="0" max="999" inputmode="numeric" aria-label="50 to 100 SF count" />
+            <button type="button" class="step-btn" data-action="inc" data-key="t50_100" aria-label="Increase 50–100 SF">+</button>
+          </div>
+        </div>
+        <div class="counter-row" data-key="over100">
+          <div class="counter-label">
+            <span class="counter-name">Over 100 SF</span>
+            <span class="counter-sf">Custom $ each</span>
+          </div>
+          <div class="stepper">
+            <button type="button" class="step-btn" data-action="dec" data-key="over100" aria-label="Decrease over 100 SF">−</button>
+            <input type="number" class="step-value" id="count-over100" value="0" min="0" max="999" inputmode="numeric" aria-label="Over 100 SF count" />
+            <button type="button" class="step-btn" data-action="inc" data-key="over100" aria-label="Increase over 100 SF">+</button>
+          </div>
+        </div>
       </div>
-      <div id="patch-list"></div>
-    </section>
 
-    <section class="card">
-      <h2>Manual add-ons</h2>
-      <p class="hint">These rates stay the same on either sheet.</p>
-      <div class="addon">
-        <label for="skim-sf">Skim coat <span>$7.80 / SF</span></label>
-        <input id="skim-sf" inputmode="decimal" autocomplete="off" placeholder="0">
-        <p id="skim-amount" class="addon-amount">$0.00</p>
-      </div>
-      <div class="addon">
-        <label for="paint-sf">Paint <span>$3.16 / SF</span></label>
-        <input id="paint-sf" inputmode="decimal" autocomplete="off" placeholder="0">
-        <p id="paint-amount" class="addon-amount">$0.00</p>
+      <div id="over100-list-wrap" class="over100-block hidden">
+        <p class="hint tight">Enter SF and custom $ for each over-100 patch (no sheet tier; total always works — no Inspect lock).</p>
+        <div id="over100-list" class="custom-patch-list"></div>
       </div>
     </section>
 
-    <section class="card">
-      <label for="notes">Notes</label>
-      <textarea id="notes" maxlength="2000" rows="3" placeholder="Rooms, texture, or access notes"></textarea>
+    <!-- Skim / Retexture & Paint -->
+    <section class="card" aria-labelledby="sf-label">
+      <h2 id="sf-label" class="section-title">Skim / Retexture &amp; Paint</h2>
+      <p class="hint tight" id="addon-sf-hint">Enter skim and paint square footage manually. Rates from your price sheets — fields are independent.</p>
+      <div class="addon-sf-grid">
+        <label class="field">
+          <span>Skim &amp; retexture — SF <small class="rate-tag">$7.80 / SF</small></span>
+          <input type="number" id="skim-sf" inputmode="decimal" step="0.01" min="0" placeholder="0" aria-label="Skim and retexture square feet" />
+        </label>
+        <div id="paint-sf-wrap">
+          <label class="field">
+            <span id="paint-sf-label">Paint — SF <small class="rate-tag">$3.16 / SF</small></span>
+            <input type="number" id="paint-sf" inputmode="decimal" step="0.01" min="0" placeholder="0" aria-label="Paint square feet" />
+          </label>
+          <p class="hint tight hidden" id="paint-extra-note">Optional extra paint SF — all-inclusive patch tiers already include paint on the patches.</p>
+        </div>
+      </div>
+      <label class="field">
+        <span>Job notes (optional)</span>
+        <textarea id="job-notes" rows="2" placeholder="Address, room, texture notes…"></textarea>
+      </label>
     </section>
 
-    <section class="card">
-      <h2>Estimate</h2>
-      <div id="totals" class="totals"></div>
-      <p id="form-errors" class="errors" role="alert"></p>
+    <!-- Breakdown -->
+    <section class="card total-card" aria-labelledby="total-label">
+      <h2 id="total-label" class="section-title">Quote</h2>
+      <ul class="breakdown" id="breakdown">
+        <li><span>Base</span><span id="line-base">$0.00</span></li>
+      </ul>
+      <ul class="breakdown" id="tier-lines"></ul>
+      <ul class="breakdown">
+        <li id="line-skim-row" class="hidden"><span id="line-skim-label">Skim</span><span id="line-skim">$0.00</span></li>
+        <li id="line-paint-row" class="hidden"><span id="line-paint-label">Paint</span><span id="line-paint">$0.00</span></li>
+      </ul>
+      <div class="grand-total" id="grand-total-wrap">
+        <span>Total</span>
+        <strong id="grand-total">$0.00</strong>
+      </div>
+      <p class="missing-msg hidden" id="missing-custom-msg">Enter SF and custom $ for each patch over 100 SF to complete the quote.</p>
+      <p class="soft-note hidden" id="soft-note">Printed sheet mentions site inspection for &gt;100 SF; you can still price with a custom $ here.</p>
     </section>
 
-    <p id="status" class="status" role="status"></p>
-
-    <div class="actions">
-      <button type="button" id="download-pdf" class="primary">Download PDF</button>
-      <button type="button" id="send-jobnimbus" class="accent">Send to JobNimbus</button>
-    </div>
+    <!-- Actions -->
+    <section class="actions">
+      <button type="button" class="btn btn-primary" id="btn-pdf" aria-label="Download PDF">Download PDF</button>
+      <button type="button" class="btn btn-jn" id="btn-jn" aria-label="Send to JobNimbus">Send to JobNimbus</button>
+      <p class="hint tight action-subhint">Download a .pdf, or pick a JobNimbus job above and attach the estimate. Filename: Patch-Estimate-YYYY-MM-DD.pdf</p>
+      <button type="button" class="btn btn-secondary" id="btn-share">Copy / Share quote</button>
+      <button type="button" class="btn btn-ghost btn-reset" id="btn-reset">Reset job</button>
+    </section>
+    <p class="toast hidden" id="toast" role="status"></p>
   </main>
 
-  <dialog id="confirm-dialog">
-    <form method="dialog">
-      <h2>Send to JobNimbus?</h2>
-      <p id="confirm-text"></p>
-      <div class="dialog-actions">
-        <button value="cancel" class="secondary">Cancel</button>
-        <button value="send" id="confirm-send" class="accent">Send PDF</button>
-      </div>
-    </form>
-  </dialog>
+  <footer class="footer">
+    <p>24 Hour Flood Pros of Portland · Offline-ready after first load</p>
+  </footer>
 
-  <noscript>Turn on JavaScript to price patches and build the PDF.</noscript>
-  <script src="pricing.js"></script>
-  <script src="vendor/jspdf.umd.min.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

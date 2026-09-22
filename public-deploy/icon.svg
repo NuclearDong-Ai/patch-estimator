@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Patch Estimator">
+  <rect width="512" height="512" rx="96" fill="#0b3d5c"/>
+  <rect x="96" y="96" width="320" height="320" rx="24" fill="#1474a8"/>
+  <rect x="160" y="160" width="192" height="192" rx="16" fill="#e8a317"/>
+  <path d="M220 256h72M256 220v72" stroke="#0b3d5c" stroke-width="28" stroke-linecap="round"/>
+  <circle cx="256" cy="256" r="18" fill="#0b3d5c"/>
+</svg>
